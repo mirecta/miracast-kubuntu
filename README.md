@@ -17,4 +17,14 @@ Pipeline: NetworkManager Wi-Fi P2P (D-Bus) -> RTSP/WFD (M1..M16) on TCP 7236 ->
 KWin `zkde_screencast_unstable_v1` -> PipeWire -> VA-API H.264 (x264 fallback) + AAC ->
 MPEG-TS -> RTP/UDP.
 
+## GUI
+
+```
+cargo install --path ui
+miracast-ui
+```
+
+On first start it registers itself with KWin and adds **Miracast** to the application menu.
+Pick a TV, choose Extend (new monitor) or Mirror, resolution, bitrate and sound, and press Connect.
+
 Testing without a TV: `miracast cast --no-p2p --test-pattern` + `miracast fake-sink --dump out.ts`.

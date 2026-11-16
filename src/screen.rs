@@ -51,6 +51,47 @@ impl Screencast {
     }
 }
 
+impl Drop for Screencast {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Connector names of the current outputs (e.g. ["eDP-1", "HDMI-A-1"]).
+pub fn list_outputs() -> Result<Vec<String>> {
+    let conn = Connection::connect_to_env()?;
+    let mut queue = conn.new_event_queue::<State>();
+    let qh = queue.handle();
+    conn.display().get_registry(&qh, ());
+    let mut st = State::default();
+    queue.roundtrip(&mut st)?;
+    queue.roundtrip(&mut st)?;
+    Ok(st.outputs.into_iter().filter_map(|(_, n)| n).filter(|n| !n.starts_with("Virtual-")).collect())
+}
+
+/// Write a .desktop file so KWin grants `exe` the screencast protocol.
+/// `menu_name = Some(..)` also makes it visible in the application menu.
+pub fn install_desktop_file(exe: &std::path::Path, id: &str, menu_name: Option<&str>) -> Result<std::path::PathBuf> {
+    let dir = std::path::PathBuf::from(std::env::var("HOME")?).join(".local/share/applications");
+    std::fs::create_dir_all(&dir)?;
+    let file = dir.join(format!("{id}.desktop"));
+    let (name, nodisplay, terminal) = match menu_name {
+        Some(n) => (n, "false", "false"),
+        None => ("Miracast (CLI)", "true", "true"),
+    };
+    std::fs::write(
+        &file,
+        format!(
+            "[Desktop Entry]\nType=Application\nName={name}\nComment=Use a Miracast TV as a monitor\n\
+             Exec={}\nIcon=video-display\nTerminal={terminal}\nNoDisplay={nodisplay}\n\
+             Categories=Utility;System;\nX-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1\n",
+            exe.display()
+        ),
+    )?;
+    let _ = std::process::Command::new("kbuildsycoca6").arg("--noincremental").output();
+    Ok(file)
+}
+
 #[derive(Default)]
 struct State {
     screencast: Option<(u32, u32)>, // (name, version)
