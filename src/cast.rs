@@ -83,6 +83,7 @@ pub async fn cast(o: CastOpts, report: Reporter, cancel: CancellationToken) -> R
     let listener = TcpListener::bind("0.0.0.0:7236").await.context("cannot listen on TCP 7236 (is another instance running?)")?;
 
     let mut p2p_state = None;
+    let mut link_iface: Option<String> = None;
     let mut tv_name = "TV".to_string();
     let result = async {
         if !o.no_p2p {
@@ -102,10 +103,13 @@ pub async fn cast(o: CastOpts, report: Reporter, cancel: CancellationToken) -> R
             };
             let (iface, ip) = p2p.group_info(&active).await.unwrap_or_default();
             report(Status::Info(format!("Wi-Fi Direct link up on {iface}, our IP {}", ip.as_deref().unwrap_or("?"))));
+            if !iface.is_empty() {
+                link_iface = Some(iface);
+            }
             p2p_state = Some((p2p, active));
         }
         report(Status::WaitingForTv);
-        session(&o, &listener, &tv_name, &report, &cancel).await
+        session(&o, &listener, &tv_name, link_iface.as_deref(), &report, &cancel).await
     }
     .await;
 
@@ -115,7 +119,7 @@ pub async fn cast(o: CastOpts, report: Reporter, cancel: CancellationToken) -> R
     result
 }
 
-async fn session(o: &CastOpts, listener: &TcpListener, tv_name: &str, report: &Reporter, cancel: &CancellationToken) -> Result<()> {
+async fn session(o: &CastOpts, listener: &TcpListener, tv_name: &str, link_iface: Option<&str>, report: &Reporter, cancel: &CancellationToken) -> Result<()> {
     let mut src = tokio::select! {
         r = tokio::time::timeout(Duration::from_secs(40), source::WfdSource::accept(listener, o.verbose)) =>
             r.context("the TV did not open the RTSP control connection")??,
@@ -189,6 +193,9 @@ async fn session(o: &CastOpts, listener: &TcpListener, tv_name: &str, report: &R
     let mut kf_left = 4; // a few early IDRs help sinks that join late
     let mut idr_requests = 0u32;
     let mut last_dropped = 0u64;
+    let mut last_flushes = 0u64;
+    let mut last_kbps = o.bitrate;
+    let mut stats_tick = tokio::time::interval(Duration::from_secs(5));
 
     let res = loop {
         tokio::select! {
@@ -206,11 +213,23 @@ async fn session(o: &CastOpts, listener: &TcpListener, tv_name: &str, report: &R
             },
             _ = keepalive.tick() => {
                 if let Err(e) = src.keepalive().await { break Err(e); }
-                let d = stream.stats.dropped.load(std::sync::atomic::Ordering::Relaxed);
+            }
+            _ = stats_tick.tick() => {
+                use std::sync::atomic::Ordering::Relaxed;
+                let (d, f) = (stream.stats.dropped.load(Relaxed), stream.stats.flushes.load(Relaxed));
+                let kbps = stream.stats.bitrate_kbps.load(Relaxed);
+                let link = link_iface.and_then(link_stats).unwrap_or_default();
+                let mut line = format!("video {kbps} kbit/s");
                 if d > last_dropped {
-                    report(Status::Info(format!("{} packets dropped locally in the last 20 s", d - last_dropped)));
-                    last_dropped = d;
+                    line.push_str(&format!(", dropped {} packets ({} stalls)", d - last_dropped, f - last_flushes));
                 }
+                if !link.is_empty() {
+                    line.push_str(&format!(" | link {link}"));
+                }
+                if kbps != last_kbps || d > last_dropped || o.verbose {
+                    report(Status::Info(line));
+                }
+                (last_dropped, last_flushes, last_kbps) = (d, f, kbps);
             }
             _ = kf.tick(), if kf_left > 0 => { kf_left -= 1; stream.force_keyframe(); }
             msg = bus.next() => {
@@ -257,4 +276,20 @@ pub async fn scan(secs: u64, on_update: impl Fn(&[p2p::Peer]) + Send, cancel: Ca
         bail!("{}", r.unwrap_err());
     }
     Ok(())
+}
+
+/// "72.2 Mbit/s, -48 dBm, retries 1234, failed 5" from `iw dev <iface> station dump`.
+fn link_stats(iface: &str) -> Option<String> {
+    let out = std::process::Command::new("iw").args(["dev", iface, "station", "dump"]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let get = |key: &str| {
+        text.lines().find_map(|l| l.trim().strip_prefix(key).map(|v| v.trim().to_string()))
+    };
+    let rate = get("tx bitrate:")?.split(" MBit/s").next()?.to_string();
+    let signal = get("signal:").and_then(|s| s.split_whitespace().next().map(String::from)).unwrap_or_default();
+    Some(format!(
+        "{rate} Mbit/s, {signal} dBm, tx retries {}, failed {}",
+        get("tx retries:").unwrap_or_default(),
+        get("tx failed:").unwrap_or_default()
+    ))
 }

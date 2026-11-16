@@ -39,7 +39,10 @@ pub fn describe(c: &Config) -> Result<String> {
         VideoInput::PipeWire(node) => {
             format!("pipewiresrc path={node} do-timestamp=true keepalive-time=100 always-copy=true ! queue leaky=downstream max-size-buffers=3")
         }
-        VideoInput::TestPattern => format!("videotestsrc is-live=true pattern=ball ! video/x-raw,width={w},height={h}"),
+        VideoInput::TestPattern => format!(
+            "videotestsrc is-live=true pattern={} ! video/x-raw,width={w},height={h}",
+            std::env::var("MIRACAST_TEST_PATTERN").unwrap_or_else(|_| "ball".into())
+        ),
     };
     let use_va = match c.encoder {
         Encoder::Va => true,
@@ -104,7 +107,8 @@ impl Stream {
             .and_then(|e| e.downcast::<gstreamer_app::AppSink>().ok())
             .ok_or_else(|| anyhow!("appsink missing"))?;
         let dest = std::net::SocketAddr::new(c.host.parse().context("bad sink IP")?, c.port);
-        let stats = crate::sender::attach(&appsink, dest, c.bind_port, c.bitrate_kbps)?;
+        let enc = pipeline.by_name("venc").ok_or_else(|| anyhow!("encoder missing"))?;
+        let stats = crate::sender::attach(&appsink, enc, dest, c.bind_port, c.bitrate_kbps)?;
         Ok(Self { pipeline, stats })
     }
 
@@ -123,13 +127,9 @@ impl Stream {
 
     /// Ask the encoder for an IDR frame with SPS/PPS.
     pub fn force_keyframe(&self) {
-        let Some(enc) = self.pipeline.by_name("venc") else { return };
-        let s = gst::Structure::builder("GstForceKeyUnit")
-            .field("running-time", u64::MAX)
-            .field("all-headers", true)
-            .field("count", 0u32)
-            .build();
-        enc.send_event(gst::event::CustomUpstream::new(s));
+        if let Some(enc) = self.pipeline.by_name("venc") {
+            crate::sender::force_keyframe(&enc);
+        }
     }
 
     pub fn bus(&self) -> gst::Bus {
