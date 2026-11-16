@@ -135,6 +135,35 @@ impl WfdSource {
         Ok(neg)
     }
 
+    /// Optional extensions, asked separately so a picky sink can't break M3/M4.
+    /// Returns human-readable notes for the log.
+    pub async fn try_low_latency(&mut self) -> Vec<String> {
+        let mut notes = Vec::new();
+        let q = "microsoft_latency_management_capability\r\nmicrosoft_format_change_capability\r\n\
+                 microsoft_diagnostics_capability\r\nmicrosoft_cursor\r\nwfd_display_edid\r\n";
+        let params = match self.call("GET_PARAMETER", URL, &[], q).await {
+            Ok(r) => wfd::parse_params(&r.body),
+            Err(e) => {
+                notes.push(format!("TV: no extension info ({e})"));
+                return notes;
+            }
+        };
+        let mut keys: Vec<_> = params.iter().filter(|(k, _)| k.starts_with("microsoft_")).collect();
+        keys.sort();
+        notes.push(format!(
+            "TV extensions: {}",
+            if keys.is_empty() { "none".to_string() } else { keys.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(", ") }
+        ));
+        let lm = params.get("microsoft_latency_management_capability").map(|v| v.to_ascii_lowercase());
+        if lm.as_deref().is_some_and(|v| v != "none") {
+            match self.call("SET_PARAMETER", URL, &[], "microsoft_latency_management_capability: low\r\n").await {
+                Ok(_) => notes.push("TV low-latency mode requested".into()),
+                Err(e) => notes.push(format!("TV refused low-latency mode ({e})")),
+            }
+        }
+        notes
+    }
+
     /// M5 trigger SETUP, then wait for M6 SETUP and M7 PLAY. Returns the sink's RTP port.
     pub async fn setup_and_play(&mut self, default_port: u16) -> Result<u16> {
         self.call("SET_PARAMETER", URL, &[], "wfd_trigger_method: SETUP\r\n").await.context("M5")?;

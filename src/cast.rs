@@ -80,7 +80,8 @@ fn matches(p: &p2p::Peer, want: &Option<String>) -> bool {
 pub async fn cast(o: CastOpts, report: Reporter, cancel: CancellationToken) -> Result<()> {
     gst::init()?;
     // The TV connects to us on 7236 right after the P2P link is up, so listen first.
-    let listener = TcpListener::bind("0.0.0.0:7236").await.context("cannot listen on TCP 7236 (is another instance running?)")?;
+    let port: u16 = std::env::var("MIRACAST_RTSP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7236);
+    let listener = TcpListener::bind(("0.0.0.0", port)).await.context("cannot listen on TCP 7236 (is another instance running?)")?;
 
     let mut p2p_state = None;
     let mut link_iface: Option<String> = None;
@@ -129,6 +130,9 @@ async fn session(o: &CastOpts, listener: &TcpListener, tv_name: &str, link_iface
 
     let prefs = wfd::Prefs { max_height: o.res, max_fps: o.fps, audio: o.audio != AudioMode::None, high_profile: o.high };
     let neg = src.negotiate(&prefs).await?;
+    for n in src.try_low_latency().await {
+        report(Status::Info(n));
+    }
     let desc = format!(
         "{}x{}@{} H.264 {}, audio {}",
         neg.mode.width,
@@ -219,7 +223,7 @@ async fn session(o: &CastOpts, listener: &TcpListener, tv_name: &str, link_iface
                 let (d, f) = (stream.stats.dropped.load(Relaxed), stream.stats.flushes.load(Relaxed));
                 let kbps = stream.stats.bitrate_kbps.load(Relaxed);
                 let link = link_iface.and_then(link_stats).unwrap_or_default();
-                let mut line = format!("video {kbps} kbit/s");
+                let mut line = format!("video {kbps} kbit/s, encode delay {} ms", stream.stats.pipeline_delay_ms.load(Relaxed));
                 if d > last_dropped {
                     line.push_str(&format!(", dropped {} packets ({} stalls)", d - last_dropped, f - last_flushes));
                 }
@@ -231,7 +235,17 @@ async fn session(o: &CastOpts, listener: &TcpListener, tv_name: &str, link_iface
                 }
                 (last_dropped, last_flushes, last_kbps) = (d, f, kbps);
             }
-            _ = kf.tick(), if kf_left > 0 => { kf_left -= 1; stream.force_keyframe(); }
+            _ = kf.tick(), if kf_left > 0 => {
+                kf_left -= 1;
+                stream.force_keyframe();
+                if kf_left == 0 && o.verbose {
+                    let mut q = gst::query::Latency::new();
+                    if stream.pipeline.query(&mut q) {
+                        let (live, min, max) = q.result();
+                        report(Status::Info(format!("pipeline latency: live={live} min={min} max={max:?}")));
+                    }
+                }
+            }
             msg = bus.next() => {
                 use gst::MessageView;
                 let Some(msg) = msg else { break Ok(()) };

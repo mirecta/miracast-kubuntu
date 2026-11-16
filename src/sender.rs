@@ -31,6 +31,8 @@ pub struct Stats {
     pub dropped: AtomicU64,
     pub flushes: AtomicU64,
     pub bitrate_kbps: AtomicU32,
+    /// capture -> sender delay of the last packet, in ms (running-time based)
+    pub pipeline_delay_ms: AtomicU32,
 }
 
 pub fn force_keyframe(enc: &gst::Element) {
@@ -105,6 +107,12 @@ pub fn attach(appsink: &gst_app::AppSink, enc: gst::Element, dest: SocketAddr, b
             .new_sample(move |sink| {
                 let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                 let now = Instant::now();
+                if let (Some(clock), Some(base), Some(pts)) = (sink.clock(), sink.base_time(), sample.buffer().and_then(|b| b.pts())) {
+                    if let Some(rt) = clock.time().checked_sub(base) {
+                        let d = rt.saturating_sub(pts).mseconds() as u32;
+                        st.pipeline_delay_ms.store(d, Ordering::Relaxed);
+                    }
+                }
                 let mut push = |b: &gst::BufferRef| {
                     if tx.try_send((now, b.to_owned())).is_err() {
                         st.dropped.fetch_add(1, Ordering::Relaxed);
