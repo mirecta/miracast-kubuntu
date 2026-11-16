@@ -19,12 +19,15 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-/// A blocking send() longer than this means the kernel/Wi-Fi queue is full.
-const CONGESTED: Duration = Duration::from_millis(4);
+/// Congestion = the socket blocked for more than this share of a 2 s window.
+/// Single long pauses (Wi-Fi power save, background scan) are *not* congestion:
+/// the pacer catches up afterwards at 3x the video rate.
+const CONGESTED_SHARE: f64 = 0.35;
+const WINDOW: Duration = Duration::from_secs(2);
 /// Frames whose capture time is older than this are dropped before sending.
 const MAX_AGE_MS: u32 = 400;
 /// Packets older than this are dropped (picture would be too late anyway).
-const STALE: Duration = Duration::from_millis(200);
+const STALE: Duration = Duration::from_millis(1000);
 const MIN_KBPS: u32 = 1500;
 
 #[derive(Default)]
@@ -150,6 +153,8 @@ pub fn attach(appsink: &gst_app::AppSink, enc: gst::Element, dest: SocketAddr, b
         let mut rc = RateControl { enc, max, cur: max, last_change: Instant::now(), last_congestion: Instant::now() };
         let mut next = Instant::now();
         let mut dropping = false;
+        let mut blocked = Duration::ZERO;
+        let mut window_start = Instant::now();
         loop {
             let (t, buf) = match rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(x) => x,
@@ -175,7 +180,6 @@ pub fn attach(appsink: &gst_app::AppSink, enc: gst::Element, dest: SocketAddr, b
                 continue;
             }
             dropping = false;
-            rc.tick(&st);
 
             let Ok(map) = buf.map_readable() else { continue };
             // Pace at 2.5x the current bitrate (+ audio/overhead), allowing a 16 KB burst.
@@ -191,8 +195,16 @@ pub fn attach(appsink: &gst_app::AppSink, enc: gst::Element, dest: SocketAddr, b
             // Blocking send: if the kernel buffer is full we wait here, which shows up as delay above.
             let t_send = Instant::now();
             let res = sock.send(&map);
-            if t_send.elapsed() > CONGESTED {
-                rc.congestion(false, &st);
+            blocked += t_send.elapsed();
+            if window_start.elapsed() >= WINDOW {
+                let share = blocked.as_secs_f64() / window_start.elapsed().as_secs_f64();
+                if share > CONGESTED_SHARE {
+                    rc.congestion(false, &st);
+                } else if share < 0.05 {
+                    rc.tick(&st); // clean window: probe upwards
+                }
+                blocked = Duration::ZERO;
+                window_start = Instant::now();
             }
             if res.is_err() {
                 st.dropped.fetch_add(1, Ordering::Relaxed);
