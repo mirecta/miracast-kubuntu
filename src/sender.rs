@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-/// Queueing delay that counts as congestion.
-const CONGESTED: Duration = Duration::from_millis(40);
+/// A blocking send() longer than this means the kernel/Wi-Fi queue is full.
+const CONGESTED: Duration = Duration::from_millis(4);
 /// Packets older than this are dropped (picture would be too late anyway).
 const STALE: Duration = Duration::from_millis(200);
 const MIN_KBPS: u32 = 1500;
@@ -159,15 +159,12 @@ pub fn attach(appsink: &gst_app::AppSink, enc: gst::Element, dest: SocketAddr, b
                 continue;
             }
             dropping = false;
-            if delay > CONGESTED {
-                rc.congestion(false, &st);
-            } else {
-                rc.tick(&st);
-            }
+            rc.tick(&st);
 
             let Ok(map) = buf.map_readable() else { continue };
             // Pace at 2.5x the current bitrate (+ audio/overhead), allowing a 16 KB burst.
-            let rate = rc.cur as f64 * 1000.0 / 8.0 * 2.5 + 100_000.0;
+            // Fixed pacing rate from the *maximum* bitrate: pacing must never become the bottleneck.
+            let rate = (max as f64 * 1000.0 / 8.0 * 3.0).max(25e6 / 8.0);
             let burst = Duration::from_secs_f64(16_384.0 / rate);
             if next + burst < now {
                 next = now - burst;
@@ -176,7 +173,12 @@ pub fn attach(appsink: &gst_app::AppSink, enc: gst::Element, dest: SocketAddr, b
                 std::thread::sleep(next - now);
             }
             // Blocking send: if the kernel buffer is full we wait here, which shows up as delay above.
-            if sock.send(&map).is_err() {
+            let t_send = Instant::now();
+            let res = sock.send(&map);
+            if t_send.elapsed() > CONGESTED {
+                rc.congestion(false, &st);
+            }
+            if res.is_err() {
                 st.dropped.fetch_add(1, Ordering::Relaxed);
             } else {
                 st.sent.fetch_add(1, Ordering::Relaxed);
