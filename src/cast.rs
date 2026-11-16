@@ -187,18 +187,31 @@ async fn session(o: &CastOpts, listener: &TcpListener, tv_name: &str, report: &R
     keepalive.tick().await;
     let mut kf = tokio::time::interval(Duration::from_millis(500));
     let mut kf_left = 4; // a few early IDRs help sinks that join late
+    let mut idr_requests = 0u32;
+    let mut last_dropped = 0u64;
 
     let res = loop {
         tokio::select! {
             ev = src.next_event() => match ev {
                 Ok(source::Event::Teardown) => { report(Status::Info("TV closed the session".into())); break Ok(()); }
-                Ok(source::Event::IdrRequest) => stream.force_keyframe(),
+                Ok(source::Event::IdrRequest) => {
+                    idr_requests += 1;
+                    report(Status::Info(format!("TV reported a broken picture, sending keyframe (#{idr_requests})")));
+                    stream.force_keyframe();
+                }
                 Ok(source::Event::Pause) => stream.pause(),
                 Ok(source::Event::Play) => { let _ = stream.play(); stream.force_keyframe(); }
                 Ok(_) => {}
                 Err(e) => break Err(e.context("RTSP connection lost")),
             },
-            _ = keepalive.tick() => { if let Err(e) = src.keepalive().await { break Err(e); } }
+            _ = keepalive.tick() => {
+                if let Err(e) = src.keepalive().await { break Err(e); }
+                let d = stream.stats.dropped.load(std::sync::atomic::Ordering::Relaxed);
+                if d > last_dropped {
+                    report(Status::Info(format!("{} packets dropped locally in the last 20 s", d - last_dropped)));
+                    last_dropped = d;
+                }
+            }
             _ = kf.tick(), if kf_left > 0 => { kf_left -= 1; stream.force_keyframe(); }
             msg = bus.next() => {
                 use gst::MessageView;

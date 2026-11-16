@@ -49,10 +49,12 @@ pub fn describe(c: &Config) -> Result<String> {
     let high = c.neg.profile == 0x02;
     let profile = if high { "high" } else { "constrained-baseline" };
     let kbps = c.bitrate_kbps;
+    // CPB of ~250 ms keeps keyframes from being huge bursts
+    let cpb = kbps / 4;
     let enc = if use_va {
         format!(
             "vapostproc add-borders=true ! video/x-raw(memory:VAMemory),format=NV12,width={w},height={h} ! \
-             vah264enc name=venc rate-control=cbr bitrate={kbps} key-int-max={fps} b-frames=0 cabac={high}"
+             vah264enc name=venc rate-control=cbr bitrate={kbps} cpb-size={cpb} key-int-max={fps} b-frames=0 cabac={high}"
         )
     } else {
         if !has("x264enc") {
@@ -68,8 +70,7 @@ pub fn describe(c: &Config) -> Result<String> {
          video/x-h264,profile={profile},stream-format=byte-stream,alignment=au ! h264parse config-interval=-1 ! \
          queue max-size-time=100000000 ! mux.sink_4113 \
          mpegtsmux name=mux alignment=7 ! rtpmp2tpay pt=33 mtu=1400 ! \
-         udpsink host={} port={} bind-port={} sync=false async=false",
-        c.host, c.port, c.bind_port
+         appsink name=rtpout sync=false async=false max-buffers=0 emit-signals=false"
     );
     if c.neg.audio == Audio::Aac {
         let dev = c.audio_device.unwrap_or("@DEFAULT_MONITOR@");
@@ -84,6 +85,7 @@ pub fn describe(c: &Config) -> Result<String> {
 
 pub struct Stream {
     pub pipeline: gst::Pipeline,
+    pub stats: std::sync::Arc<crate::sender::Stats>,
 }
 
 impl Stream {
@@ -97,7 +99,13 @@ impl Stream {
             .downcast::<gst::Pipeline>()
             .map_err(|_| anyhow!("not a pipeline"))?;
         pipeline.use_clock(Some(&gst::SystemClock::obtain()));
-        Ok(Self { pipeline })
+        let appsink = pipeline
+            .by_name("rtpout")
+            .and_then(|e| e.downcast::<gstreamer_app::AppSink>().ok())
+            .ok_or_else(|| anyhow!("appsink missing"))?;
+        let dest = std::net::SocketAddr::new(c.host.parse().context("bad sink IP")?, c.port);
+        let stats = crate::sender::attach(&appsink, dest, c.bind_port, c.bitrate_kbps)?;
+        Ok(Self { pipeline, stats })
     }
 
     pub fn play(&self) -> Result<()> {

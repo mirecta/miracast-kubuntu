@@ -7,6 +7,7 @@ pub mod p2p;
 pub mod pipeline;
 pub mod rtsp;
 pub mod screen;
+pub mod sender;
 pub mod source;
 pub mod wfd;
 
