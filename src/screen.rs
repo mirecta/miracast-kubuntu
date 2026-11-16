@@ -162,6 +162,10 @@ fn run(source: Source, res_tx: &mpsc::Sender<Result<u32>>, stop_rx: mpsc::Receiv
     queue.roundtrip(&mut st)?;
     queue.roundtrip(&mut st)?; // wl_output names
 
+    let exe = std::fs::read_link("/proc/self/exe").map(|p| p.display().to_string()).unwrap_or_default();
+    if st.screencast.is_none() && exe.ends_with(" (deleted)") {
+        bail!("this program was updated while running – close it and start it again");
+    }
     let (gname, gver) = st.screencast.ok_or_else(|| {
         anyhow!(
             "KWin does not expose {IFACE} to this program.\n\
