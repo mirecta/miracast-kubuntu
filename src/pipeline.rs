@@ -13,7 +13,8 @@ pub enum Encoder {
 }
 
 pub enum VideoInput {
-    PipeWire(u32),
+    /// `capture_ts`: use KWin's capture timestamps (reliable for real outputs) instead of arrival time
+    PipeWire { node: u32, capture_ts: bool },
     TestPattern,
 }
 
@@ -36,8 +37,13 @@ pub fn describe(c: &Config) -> Result<String> {
     let m = c.neg.mode;
     let (w, h, fps) = (m.width, m.height, m.fps);
     let src = match c.input {
-        VideoInput::PipeWire(node) => {
-            format!("pipewiresrc path={node} do-timestamp=true keepalive-time=100 always-copy=true ! queue leaky=downstream max-size-buffers=3")
+        VideoInput::PipeWire { node, capture_ts } => {
+            format!(
+                "pipewiresrc path={node} {} ! video/x-raw,max-framerate={fps}/1 ! queue leaky=downstream max-size-buffers=2",
+                // KWin limited to our fps; capture timestamps make backlog measurable (mirror)
+                std::env::var("MIRACAST_PW")
+                    .unwrap_or_else(|_| format!("do-timestamp={} keepalive-time=100 always-copy=true", !capture_ts))
+            )
         }
         VideoInput::TestPattern => format!(
             "videotestsrc is-live=true pattern={} ! video/x-raw,width={w},height={h}",
@@ -108,7 +114,8 @@ impl Stream {
             .ok_or_else(|| anyhow!("appsink missing"))?;
         let dest = std::net::SocketAddr::new(c.host.parse().context("bad sink IP")?, c.port);
         let enc = pipeline.by_name("venc").ok_or_else(|| anyhow!("encoder missing"))?;
-        let stats = crate::sender::attach(&appsink, enc, dest, c.bind_port, c.bitrate_kbps)?;
+        let drop_late = matches!(c.input, VideoInput::PipeWire { capture_ts: true, .. });
+        let stats = crate::sender::attach(&appsink, enc, dest, c.bind_port, c.bitrate_kbps, drop_late)?;
         Ok(Self { pipeline, stats })
     }
 

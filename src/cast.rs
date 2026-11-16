@@ -175,7 +175,7 @@ async fn session(o: &CastOpts, listener: &TcpListener, tv_name: &str, link_iface
     let rtp_port = src.setup_and_play(neg.rtp_port).await?;
     let cfg = pipeline::Config {
         input: match &cast {
-            Some(c) => pipeline::VideoInput::PipeWire(c.node_id),
+            Some(c) => pipeline::VideoInput::PipeWire { node: c.node_id, capture_ts: o.mirror.is_some() },
             None => pipeline::VideoInput::TestPattern,
         },
         audio_device: audio_dev.as_deref(),

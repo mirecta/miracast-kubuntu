@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 
 /// A blocking send() longer than this means the kernel/Wi-Fi queue is full.
 const CONGESTED: Duration = Duration::from_millis(4);
+/// Frames whose capture time is older than this are dropped before sending.
+const MAX_AGE_MS: u32 = 400;
 /// Packets older than this are dropped (picture would be too late anyway).
 const STALE: Duration = Duration::from_millis(200);
 const MIN_KBPS: u32 = 1500;
@@ -84,7 +86,9 @@ impl RateControl {
     }
 }
 
-pub fn attach(appsink: &gst_app::AppSink, enc: gst::Element, dest: SocketAddr, bind_port: u16, bitrate_kbps: u32) -> Result<Arc<Stats>> {
+/// `drop_late`: drop frames whose capture timestamp is older than MAX_AGE_MS
+/// (only meaningful when the source carries real capture timestamps).
+pub fn attach(appsink: &gst_app::AppSink, enc: gst::Element, dest: SocketAddr, bind_port: u16, bitrate_kbps: u32, drop_late: bool) -> Result<Arc<Stats>> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_reuse_address(true)?;
     // Small buffer: when the link can't keep up we want to notice (send blocks)
@@ -102,6 +106,8 @@ pub fn attach(appsink: &gst_app::AppSink, enc: gst::Element, dest: SocketAddr, b
     let (tx, rx) = mpsc::sync_channel::<(Instant, gst::Buffer)>(3000);
 
     let st = stats.clone();
+    let enc_cb = enc.clone();
+    let stale = std::sync::atomic::AtomicBool::new(false);
     appsink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
@@ -111,6 +117,16 @@ pub fn attach(appsink: &gst_app::AppSink, enc: gst::Element, dest: SocketAddr, b
                     if let Some(rt) = clock.time().checked_sub(base) {
                         let d = rt.saturating_sub(pts).mseconds() as u32;
                         st.pipeline_delay_ms.store(d, Ordering::Relaxed);
+                        if drop_late && d > MAX_AGE_MS {
+                            // Capture side fell behind: never let latency build up on the TV.
+                            if !stale.swap(true, Ordering::Relaxed) {
+                                st.flushes.fetch_add(1, Ordering::Relaxed);
+                                force_keyframe(&enc_cb);
+                            }
+                            st.dropped.fetch_add(1, Ordering::Relaxed);
+                            return Ok(gst::FlowSuccess::Ok);
+                        }
+                        stale.store(false, Ordering::Relaxed);
                     }
                 }
                 let mut push = |b: &gst::BufferRef| {
