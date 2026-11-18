@@ -31,6 +31,7 @@ struct App {
 
     peers: Vec<Peer>,
     selected: Option<String>, // MAC
+    auto_selected: Option<String>,
     show_all: bool,
     scanning: Option<CancellationToken>,
 
@@ -62,6 +63,7 @@ impl App {
             ctx: cc.egui_ctx.clone(),
             peers: vec![],
             selected: None,
+            auto_selected: None,
             show_all: false,
             scanning: None,
             extend: true,
@@ -84,7 +86,18 @@ impl App {
     }
 
     fn push_log(&mut self, s: impl Into<String>) {
-        self.log.push(s.into());
+        let s = s.into();
+        // Also keep a log file so problems can be looked at after the window is closed.
+        let f = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state/miracast/ui.log");
+        if let Some(d) = f.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(&f) {
+            use std::io::Write;
+            let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let _ = writeln!(fh, "{t} {s}");
+        }
+        self.log.push(s);
         if self.log.len() > 200 {
             self.log.remove(0);
         }
@@ -178,8 +191,15 @@ impl App {
             match m {
                 Msg::Peers(p) => {
                     self.peers = p;
-                    if self.selected.is_none() {
-                        self.selected = self.peers.iter().find(|p| p.is_sink()).map(|p| p.hw_address.clone());
+                    // Prefer the TV used last time; otherwise the first display found.
+                    let last = miracast::last_tv();
+                    let remembered = self.peers.iter().find(|p| Some(p.hw_address.to_lowercase()) == last);
+                    let user_picked = self.selected.as_ref().is_some_and(|s| Some(s.to_lowercase()) != self.auto_selected.clone().map(|a| a.to_lowercase()));
+                    if !user_picked {
+                        if let Some(p) = remembered.or_else(|| self.peers.iter().find(|p| p.is_sink())) {
+                            self.selected = Some(p.hw_address.clone());
+                            self.auto_selected = self.selected.clone();
+                        }
                     }
                 }
                 Msg::ScanDone(r) => {

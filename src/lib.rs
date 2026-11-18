@@ -11,5 +11,5 @@ pub mod sender;
 pub mod source;
 pub mod wfd;
 
-pub use cast::{AudioMode, CastOpts, Reporter, Status, cast, scan};
+pub use cast::{AudioMode, CastOpts, Reporter, Status, cast, last_tv, scan};
 pub use tokio_util::sync::CancellationToken;

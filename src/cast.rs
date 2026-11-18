@@ -66,6 +66,28 @@ pub enum Status {
 
 pub type Reporter = Arc<dyn Fn(Status) + Send + Sync>;
 
+fn state_file(name: &str) -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state"));
+    base.join("miracast").join(name)
+}
+
+/// MAC address of the TV we last streamed to successfully.
+pub fn last_tv() -> Option<String> {
+    let s = std::fs::read_to_string(state_file("last_tv")).ok()?;
+    let s = s.trim().to_lowercase();
+    (!s.is_empty()).then_some(s)
+}
+
+fn save_last_tv(mac: &str) {
+    let f = state_file("last_tv");
+    if let Some(d) = f.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(f, mac);
+}
+
 fn matches(p: &p2p::Peer, want: &Option<String>) -> bool {
     match want {
         Some(w) => {
@@ -86,16 +108,30 @@ pub async fn cast(o: CastOpts, report: Reporter, cancel: CancellationToken) -> R
     let mut p2p_state = None;
     let mut link_iface: Option<String> = None;
     let mut tv_name = "TV".to_string();
+    let mut tv_mac: Option<String> = None;
     let result = async {
         if !o.no_p2p {
             let p2p = p2p::P2p::new().await?;
             report(Status::Searching);
+            // Without an explicit choice prefer the TV we used last time: a neighbour's
+            // display may show up first. Fall back to any display after a while.
+            let want = o.peer.clone().or_else(last_tv);
+            let started = std::time::Instant::now();
+            let fallback = o.peer.is_none();
+            let pick = |peers: &[p2p::Peer]| {
+                peers.iter().find(|p| matches(p, &want) && (o.peer.is_some() || p.is_sink())).cloned().or_else(|| {
+                    (fallback && started.elapsed() > Duration::from_secs(12)).then(|| peers.iter().find(|p| p.is_sink()).cloned()).flatten()
+                })
+            };
             let peers = tokio::select! {
-                r = p2p.discover(60, |peers| peers.iter().any(|p| matches(p, &o.peer))) => r?,
+                r = p2p.discover(60, |peers| pick(peers).is_some()) => r?,
                 _ = cancel.cancelled() => { p2p.stop_find().await; return Ok(()); }
             };
-            let peer = peers.into_iter().find(|p| matches(p, &o.peer)).ok_or_else(|| anyhow!("no matching display found"))?;
+            let peer = pick(&peers)
+                .or_else(|| if fallback { peers.iter().find(|p| p.is_sink()).cloned() } else { None })
+                .ok_or_else(|| anyhow!("no matching display found – is Screen Mirroring on the TV turned on?"))?;
             tv_name = peer.name.clone();
+            tv_mac = Some(peer.hw_address.to_lowercase());
             report(Status::Connecting(peer.name.clone()));
             let p2p = Arc::new(p2p);
             let active = tokio::select! {
@@ -110,7 +146,7 @@ pub async fn cast(o: CastOpts, report: Reporter, cancel: CancellationToken) -> R
             p2p_state = Some((p2p, active));
         }
         report(Status::WaitingForTv);
-        session(&o, &listener, &tv_name, link_iface.as_deref(), &report, &cancel).await
+        session(&o, &listener, &tv_name, tv_mac.as_deref(), link_iface.as_deref(), &report, &cancel).await
     }
     .await;
 
@@ -120,7 +156,7 @@ pub async fn cast(o: CastOpts, report: Reporter, cancel: CancellationToken) -> R
     result
 }
 
-async fn session(o: &CastOpts, listener: &TcpListener, tv_name: &str, link_iface: Option<&str>, report: &Reporter, cancel: &CancellationToken) -> Result<()> {
+async fn session(o: &CastOpts, listener: &TcpListener, tv_name: &str, tv_mac: Option<&str>, link_iface: Option<&str>, report: &Reporter, cancel: &CancellationToken) -> Result<()> {
     let mut src = tokio::select! {
         r = tokio::time::timeout(Duration::from_secs(40), source::WfdSource::accept(listener, o.verbose)) =>
             r.context("the TV did not open the RTSP control connection")??,
@@ -189,6 +225,9 @@ async fn session(o: &CastOpts, listener: &TcpListener, tv_name: &str, link_iface
     let stream = pipeline::Stream::new(&cfg, o.verbose)?;
     stream.play()?;
     report(Status::Streaming(format!("{tv_name}: {desc}")));
+    if let Some(mac) = tv_mac {
+        save_last_tv(mac);
+    }
 
     let mut bus = stream.bus().stream();
     let mut keepalive = tokio::time::interval(Duration::from_secs(20));
